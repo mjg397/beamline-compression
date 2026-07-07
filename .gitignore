@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# Raw detector data can be very large. Keep directory placeholders tracked.
+data/raw/**
+!data/raw/
+!data/raw/.gitkeep
+!data/raw/hedm/
+!data/raw/hedm/.gitkeep
+!data/raw/sem/
+!data/raw/sem/.gitkeep
+
+data/processed/**
+!data/processed/
+!data/processed/.gitkeep
+
+results/**
+!results/
+!results/.gitkeep
