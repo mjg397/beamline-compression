@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .venv/
+*.egg-info/
 
 # Raw detector data can be very large. Keep directory placeholders tracked.
 data/raw/**

@@ -3,6 +3,10 @@
 Scores are initial guesses from the meeting notes, not final results. Update
 them after each benchmark.
 
+Measured results, including the raw HEXRD NIST Ruby frame, are in
+[`benchmark-comparison-matrix.md`](benchmark-comparison-matrix.md). The
+edgeBragg patches are preprocessed and must not be used as the raw baseline.
+
 | Priority | Candidate | Best target | Why it is in scope | First implementation | FPGA complexity | Initial promise | Citation/source |
 |---:|---|---|---|---|---|---:|---|
 | 1 | Threshold plus run-length encoding | Sparse HEDM | The notes suggest most of the HEDM frame can become zero after background removal. Long zero runs should be cheap to represent. | Custom software encoder after median/background zeroing. | Low to medium; streaming if runs are emitted linearly. | 9 | Golomb, "Run-Length Encodings", IEEE Trans. IT, 1966, https://doi.org/10.1109/TIT.1966.1053907 |

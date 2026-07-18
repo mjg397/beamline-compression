@@ -1,370 +1,434 @@
-"""Command-line compression benchmark helpers.
-
-This starter intentionally uses the Python standard library first. Optional
-codecs can be added once representative HEDM and SEM data are available.
-"""
+"""Run the beamline array compression comparison and write CSV results."""
 
 from __future__ import annotations
 
 import argparse
-import bz2
 import csv
-import importlib
-import importlib.util
-import lzma
-import statistics
-import sys
+import json
 import time
-import zlib
-from array import array
-from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 
-INTEGER_DTYPES = {
-    "u16le": ("H", 2, 16),
-    "u32le": ("I", 4, 32),
-}
-
-
-@dataclass(frozen=True)
-class PreprocessOptions:
-    dtype: str = "bytes"
-    zero_mode: str = "none"
-    drop_low_bits: int = 0
-    keep_bit_range: tuple[int, int] | None = None
+from beamcomp.compressors import ArrayMetadata, Compressor, available_compressors
+from beamcomp.data import load_array
+from beamcomp.preprocessing import (
+    ParameterValue,
+    PreprocessingSpec,
+    apply_preprocessing,
+    default_preprocessing_specs,
+    fixed_threshold_spec,
+)
 
 
 @dataclass(frozen=True)
 class BenchmarkResult:
-    path: Path
-    original_bytes: int
-    prepared_bytes: int
+    dataset_type: str
+    input_filename: str
+    image_shape: tuple[int, ...]
     dtype: str
-    preprocess: str
-    algorithm: str
+    preprocessing_method: str
+    preprocessing_parameters: dict[str, ParameterValue]
+    preprocessing_lossless: bool
+    compressor_name: str
+    lossless_vs_raw_input: bool
+    reconstruction_correct: bool
+    original_raw_bytes: int
+    preprocessed_bytes: int
     compressed_bytes: int
-    ratio_vs_original: float
-    ratio_vs_prepared: float
-    encode_ms: float
-    encode_mb_s: float
+    compression_ratio_vs_raw: float
+    compression_ratio_vs_preprocessed: float
+    compression_time_ms: float
+    decompression_time_ms: float
+    compression_throughput_mb_s: float
+    decompression_throughput_mb_s: float
+    percent_nonzero_before: float
+    percent_nonzero_after: float
+    max_absolute_error_vs_raw: float | None
     notes: str
 
 
-Compressor = tuple[str, Callable[[bytes], bytes], str]
+CSV_FIELDS = [
+    "dataset_type",
+    "input_filename",
+    "image_shape",
+    "dtype",
+    "preprocessing_method",
+    "preprocessing_parameters",
+    "preprocessing_lossless",
+    "compressor_name",
+    "lossless_vs_raw_input",
+    "reconstruction_correct",
+    "original_raw_bytes",
+    "preprocessed_bytes",
+    "compressed_bytes",
+    "compression_ratio_vs_raw",
+    "compression_ratio_vs_preprocessed",
+    "compression_time_ms",
+    "decompression_time_ms",
+    "compression_throughput_mb_s",
+    "decompression_throughput_mb_s",
+    "percent_nonzero_before",
+    "percent_nonzero_after",
+    "max_absolute_error_vs_raw",
+    "notes",
+]
 
 
-def module_available(name: str) -> bool:
-    try:
-        return importlib.util.find_spec(name) is not None
-    except ModuleNotFoundError:
-        return False
+def _percent_nonzero(array: np.ndarray) -> float:
+    if array.size == 0:
+        return 0.0
+    return 100.0 * float(np.count_nonzero(array)) / array.size
 
 
-def read_int_array(data: bytes, dtype: str) -> tuple[array, int]:
-    """Read little-endian unsigned integer data into a native-endian array."""
-    if dtype not in INTEGER_DTYPES:
-        raise ValueError(f"{dtype!r} is not an integer dtype")
-
-    typecode, item_size, bit_width = INTEGER_DTYPES[dtype]
-    values = array(typecode)
-    if values.itemsize != item_size:
-        raise RuntimeError(f"Python array type {typecode!r} is not {item_size} bytes")
-    if len(data) % item_size:
-        raise ValueError(f"{dtype} data length must be a multiple of {item_size}")
-
-    values.frombytes(data)
-    if sys.byteorder != "little":
-        values.byteswap()
-    return values, bit_width
+def _arrays_exact(left: np.ndarray, right: np.ndarray) -> bool:
+    return (
+        left.shape == right.shape
+        and left.dtype == right.dtype
+        and np.ascontiguousarray(left).tobytes(order="C")
+        == np.ascontiguousarray(right).tobytes(order="C")
+    )
 
 
-def int_array_to_le_bytes(values: array) -> bytes:
-    output = array(values.typecode, values)
-    if sys.byteorder != "little":
-        output.byteswap()
-    return output.tobytes()
+def _max_absolute_error(reference: np.ndarray, candidate: np.ndarray) -> float:
+    if reference.shape != candidate.shape or reference.size == 0:
+        return 0.0
+    conversion = np.complex128 if np.issubdtype(reference.dtype, np.complexfloating) else np.float64
+    difference = np.abs(reference.astype(conversion) - candidate.astype(conversion))
+    finite_difference = difference[~np.isnan(difference)]
+    return float(np.max(finite_difference)) if finite_difference.size else 0.0
 
 
-def parse_keep_bit_range(text: str) -> tuple[int, int]:
-    try:
-        low_text, high_text = text.split(":", maxsplit=1)
-        low = int(low_text)
-        high = int(high_text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("bit range must look like LOW:HIGH") from exc
-
-    if low < 0 or high < low:
-        raise argparse.ArgumentTypeError("bit range must satisfy 0 <= LOW <= HIGH")
-    return low, high
+def _throughput_mb_s(byte_count: int, elapsed_seconds: float) -> float:
+    if byte_count == 0 or elapsed_seconds <= 0:
+        return 0.0
+    return (byte_count / 1_000_000) / elapsed_seconds
 
 
-def _sample(values: array, limit: int = 1_000_000) -> array:
-    if len(values) <= limit:
-        return values
-    stride = max(1, len(values) // limit)
-    return values[::stride]
-
-
-def apply_preprocess(data: bytes, options: PreprocessOptions) -> tuple[bytes, str, str]:
-    if options.dtype == "bytes":
-        if (
-            options.zero_mode != "none"
-            or options.drop_low_bits
-            or options.keep_bit_range is not None
-        ):
-            raise ValueError("numeric preprocessing requires --dtype u16le or u32le")
-        return data, "none", ""
-
-    values, bit_width = read_int_array(data, options.dtype)
-    notes: list[str] = []
-    labels: list[str] = []
-
-    if options.zero_mode != "none":
-        sample = _sample(values)
-        median = float(statistics.median(sample))
-        threshold = median
-        if options.zero_mode == "zero-below-median-plus-2std":
-            spread = statistics.pstdev(sample) if len(sample) > 1 else 0.0
-            threshold = median + (2.0 * spread)
-        elif options.zero_mode != "zero-below-median":
-            raise ValueError(f"unknown zero mode: {options.zero_mode}")
-
-        zeroed = 0
-        for index, value in enumerate(values):
-            if value <= threshold:
-                values[index] = 0
-                zeroed += 1
-        labels.append(options.zero_mode)
-        notes.append(f"zeroed {zeroed}/{len(values)} values <= {threshold:.3f}")
-
-    if options.drop_low_bits:
-        if options.drop_low_bits >= bit_width:
-            raise ValueError("--drop-low-bits must be smaller than the dtype width")
-        mask = ((1 << bit_width) - 1) ^ ((1 << options.drop_low_bits) - 1)
-        for index, value in enumerate(values):
-            values[index] = value & mask
-        labels.append(f"drop-low-bits-{options.drop_low_bits}")
-        notes.append(f"cleared {options.drop_low_bits} low-order bits")
-
-    if options.keep_bit_range is not None:
-        low, high = options.keep_bit_range
-        if high >= bit_width:
-            raise ValueError(f"bit range high value must be < {bit_width}")
-        mask = ((1 << (high - low + 1)) - 1) << low
-        for index, value in enumerate(values):
-            values[index] = value & mask
-        labels.append(f"keep-bits-{low}-{high}")
-        notes.append(f"kept bit range {low}:{high}")
-
-    label = "+".join(labels) if labels else "none"
-    return int_array_to_le_bytes(values), label, "; ".join(notes)
-
-
-def standard_compressors() -> list[Compressor]:
-    return [
-        ("raw", lambda data: data, "uncompressed baseline"),
-        ("zlib-1", lambda data: zlib.compress(data, level=1), "DEFLATE level 1"),
-        ("zlib-6", lambda data: zlib.compress(data, level=6), "DEFLATE level 6"),
-        ("zlib-9", lambda data: zlib.compress(data, level=9), "DEFLATE level 9"),
-        ("bz2-1", lambda data: bz2.compress(data, compresslevel=1), "bzip2 level 1"),
-        ("bz2-9", lambda data: bz2.compress(data, compresslevel=9), "bzip2 level 9"),
-        ("lzma-0", lambda data: lzma.compress(data, preset=0), "LZMA preset 0"),
-        ("lzma-6", lambda data: lzma.compress(data, preset=6), "LZMA preset 6"),
-    ]
-
-
-def optional_compressors() -> list[Compressor]:
-    compressors: list[Compressor] = []
-
-    if module_available("zstandard"):
-        zstd = importlib.import_module("zstandard")
-        compressors.append(
-            (
-                "zstd-3",
-                lambda data: zstd.ZstdCompressor(level=3).compress(data),
-                "optional zstandard level 3",
-            )
-        )
-
-    if module_available("lz4.frame"):
-        lz4 = importlib.import_module("lz4.frame")
-        compressors.append(
-            (
-                "lz4-frame",
-                lambda data: lz4.compress(data),
-                "optional LZ4 frame compression",
-            )
-        )
-
-    return compressors
-
-
-def available_compressors(include_optional: bool = True) -> list[Compressor]:
-    compressors = standard_compressors()
-    if include_optional:
-        compressors.extend(optional_compressors())
-    return compressors
-
-
-def run_benchmarks(
-    path: Path,
-    data: bytes,
-    options: PreprocessOptions,
-    include_optional: bool = True,
+def benchmark_array(
+    array: np.ndarray,
+    *,
+    input_path: str | Path,
+    dataset_type: str,
+    preprocessing_specs: list[PreprocessingSpec] | None = None,
+    compressors: list[Compressor] | None = None,
+    include_optional: bool = False,
 ) -> list[BenchmarkResult]:
-    prepared, preprocess_label, preprocess_notes = apply_preprocess(data, options)
+    """Benchmark every preprocessing/compressor combination for one array."""
+    raw = np.ascontiguousarray(np.asarray(array))
+    if raw.dtype.hasobject:
+        raise ValueError("object arrays are not supported")
+
+    specs = (
+        default_preprocessing_specs()
+        if preprocessing_specs is None
+        else preprocessing_specs
+    )
+    selected_compressors = (
+        available_compressors(include_optional)
+        if compressors is None
+        else compressors
+    )
+    nonzero_before = _percent_nonzero(raw)
     results: list[BenchmarkResult] = []
 
-    for name, compress, codec_notes in available_compressors(include_optional):
-        start_ns = time.perf_counter_ns()
-        compressed = compress(prepared)
-        elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+    for spec in specs:
+        prepared = apply_preprocessing(raw, spec)
+        nonzero_after = _percent_nonzero(prepared.array)
 
-        compressed_size = len(compressed)
-        elapsed_s = max(elapsed_ms / 1_000, 1e-12)
-        encode_mb_s = (len(prepared) / 1_000_000) / elapsed_s
-        ratio_vs_original = len(data) / compressed_size if compressed_size else 0.0
-        ratio_vs_prepared = len(prepared) / compressed_size if compressed_size else 0.0
-        notes = "; ".join(part for part in (preprocess_notes, codec_notes) if part)
+        for compressor in selected_compressors:
+            compressed: bytes | None = None
+            reconstructed: np.ndarray | None = None
+            errors: list[str] = []
 
-        results.append(
-            BenchmarkResult(
-                path=path,
-                original_bytes=len(data),
-                prepared_bytes=len(prepared),
-                dtype=options.dtype,
-                preprocess=preprocess_label,
-                algorithm=name,
-                compressed_bytes=compressed_size,
-                ratio_vs_original=ratio_vs_original,
-                ratio_vs_prepared=ratio_vs_prepared,
-                encode_ms=elapsed_ms,
-                encode_mb_s=encode_mb_s,
-                notes=notes,
+            compression_start = time.perf_counter()
+            try:
+                compressed = compressor.encode(prepared.array)
+            except Exception as exc:  # Keep the rest of a long matrix running.
+                errors.append(f"compression failed: {type(exc).__name__}: {exc}")
+            compression_seconds = time.perf_counter() - compression_start
+
+            decompression_seconds = 0.0
+            if compressed is not None:
+                metadata = ArrayMetadata.from_array(prepared.array)
+                decompression_start = time.perf_counter()
+                try:
+                    reconstructed = compressor.decode(compressed, metadata)
+                except Exception as exc:  # Keep the failure visible in the CSV.
+                    errors.append(f"decompression failed: {type(exc).__name__}: {exc}")
+                decompression_seconds = time.perf_counter() - decompression_start
+
+            reconstruction_correct = (
+                reconstructed is not None
+                and _arrays_exact(prepared.array, reconstructed)
             )
-        )
+            lossless_vs_raw = (
+                reconstructed is not None
+                and reconstruction_correct
+                and _arrays_exact(raw, reconstructed)
+            )
+            max_error = None
+            if not prepared.is_lossless and reconstructed is not None:
+                max_error = _max_absolute_error(raw, reconstructed)
 
+            compressed_size = len(compressed) if compressed is not None else 0
+            ratio_vs_raw = raw.nbytes / compressed_size if compressed_size else 0.0
+            ratio_vs_prepared = (
+                prepared.array.nbytes / compressed_size if compressed_size else 0.0
+            )
+            notes = "; ".join(
+                part
+                for part in (prepared.notes, compressor.notes, *errors)
+                if part
+            )
+            results.append(
+                BenchmarkResult(
+                    dataset_type=dataset_type,
+                    input_filename=str(input_path),
+                    image_shape=tuple(int(size) for size in raw.shape),
+                    dtype=raw.dtype.str,
+                    preprocessing_method=prepared.name,
+                    preprocessing_parameters=prepared.parameters,
+                    preprocessing_lossless=prepared.is_lossless,
+                    compressor_name=compressor.name,
+                    lossless_vs_raw_input=lossless_vs_raw,
+                    reconstruction_correct=reconstruction_correct,
+                    original_raw_bytes=raw.nbytes,
+                    preprocessed_bytes=prepared.array.nbytes,
+                    compressed_bytes=compressed_size,
+                    compression_ratio_vs_raw=ratio_vs_raw,
+                    compression_ratio_vs_preprocessed=ratio_vs_prepared,
+                    compression_time_ms=compression_seconds * 1_000,
+                    decompression_time_ms=decompression_seconds * 1_000,
+                    compression_throughput_mb_s=_throughput_mb_s(
+                        prepared.array.nbytes, compression_seconds
+                    ),
+                    decompression_throughput_mb_s=_throughput_mb_s(
+                        prepared.array.nbytes, decompression_seconds
+                    ),
+                    percent_nonzero_before=nonzero_before,
+                    percent_nonzero_after=nonzero_after,
+                    max_absolute_error_vs_raw=max_error,
+                    notes=notes,
+                )
+            )
     return results
 
 
-def iter_input_files(paths: Iterable[Path]) -> Iterable[Path]:
-    for path in paths:
-        if path.is_dir():
-            yield from sorted(child for child in path.rglob("*") if child.is_file())
-        else:
-            yield path
+def benchmark_file(
+    input_path: str | Path,
+    *,
+    dataset_type: str,
+    preprocessing_specs: list[PreprocessingSpec] | None = None,
+    compressors: list[Compressor] | None = None,
+    include_optional: bool = False,
+) -> list[BenchmarkResult]:
+    path = Path(input_path)
+    return benchmark_array(
+        load_array(path),
+        input_path=path,
+        dataset_type=dataset_type,
+        preprocessing_specs=preprocessing_specs,
+        compressors=compressors,
+        include_optional=include_optional,
+    )
 
 
-def write_results(path: Path, results: list[BenchmarkResult], append: bool) -> None:
+def _format_number(value: float) -> str:
+    return f"{value:.6f}"
+
+
+def _result_to_csv_row(result: BenchmarkResult) -> dict[str, object]:
+    return {
+        "dataset_type": result.dataset_type,
+        "input_filename": result.input_filename,
+        "image_shape": json.dumps(result.image_shape, separators=(",", ":")),
+        "dtype": result.dtype,
+        "preprocessing_method": result.preprocessing_method,
+        "preprocessing_parameters": json.dumps(
+            result.preprocessing_parameters, sort_keys=True, separators=(",", ":")
+        ),
+        "preprocessing_lossless": str(result.preprocessing_lossless).lower(),
+        "compressor_name": result.compressor_name,
+        "lossless_vs_raw_input": str(result.lossless_vs_raw_input).lower(),
+        "reconstruction_correct": str(result.reconstruction_correct).lower(),
+        "original_raw_bytes": result.original_raw_bytes,
+        "preprocessed_bytes": result.preprocessed_bytes,
+        "compressed_bytes": result.compressed_bytes,
+        "compression_ratio_vs_raw": _format_number(result.compression_ratio_vs_raw),
+        "compression_ratio_vs_preprocessed": _format_number(
+            result.compression_ratio_vs_preprocessed
+        ),
+        "compression_time_ms": _format_number(result.compression_time_ms),
+        "decompression_time_ms": _format_number(result.decompression_time_ms),
+        "compression_throughput_mb_s": _format_number(
+            result.compression_throughput_mb_s
+        ),
+        "decompression_throughput_mb_s": _format_number(
+            result.decompression_throughput_mb_s
+        ),
+        "percent_nonzero_before": _format_number(result.percent_nonzero_before),
+        "percent_nonzero_after": _format_number(result.percent_nonzero_after),
+        "max_absolute_error_vs_raw": (
+            ""
+            if result.max_absolute_error_vs_raw is None
+            else _format_number(result.max_absolute_error_vs_raw)
+        ),
+        "notes": result.notes,
+    }
+
+
+def write_results_csv(
+    output_path: str | Path,
+    results: list[BenchmarkResult],
+    *,
+    append: bool = False,
+) -> None:
+    path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if append and path.exists() else "w"
-    fieldnames = [
-        "path",
-        "original_bytes",
-        "prepared_bytes",
-        "dtype",
-        "preprocess",
-        "algorithm",
-        "compressed_bytes",
-        "ratio_vs_original",
-        "ratio_vs_prepared",
-        "encode_ms",
-        "encode_mb_s",
-        "notes",
-    ]
-
-    with path.open(mode, newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        if mode == "w" or path.stat().st_size == 0:
+    needs_header = mode == "w" or path.stat().st_size == 0
+    with path.open(mode, newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+        if needs_header:
             writer.writeheader()
-        for result in results:
-            writer.writerow(
-                {
-                    "path": str(result.path),
-                    "original_bytes": result.original_bytes,
-                    "prepared_bytes": result.prepared_bytes,
-                    "dtype": result.dtype,
-                    "preprocess": result.preprocess,
-                    "algorithm": result.algorithm,
-                    "compressed_bytes": result.compressed_bytes,
-                    "ratio_vs_original": f"{result.ratio_vs_original:.6f}",
-                    "ratio_vs_prepared": f"{result.ratio_vs_prepared:.6f}",
-                    "encode_ms": f"{result.encode_ms:.3f}",
-                    "encode_mb_s": f"{result.encode_mb_s:.3f}",
-                    "notes": result.notes,
-                }
-            )
+        writer.writerows(_result_to_csv_row(result) for result in results)
+
+
+def _terminal_preprocessing_label(result: BenchmarkResult) -> str:
+    if result.preprocessing_method == "median_std_zero":
+        return f"median+{result.preprocessing_parameters.get('k', 2):g}std"
+    if result.preprocessing_method == "right_shift":
+        return f"shift {result.preprocessing_parameters['bits']} bits"
+    if result.preprocessing_method == "fixed_threshold_zero":
+        threshold = result.preprocessing_parameters["threshold"]
+        return f"fixed < {threshold:.5g}"
+    return result.preprocessing_method
+
+
+def print_results_table(results: list[BenchmarkResult]) -> None:
+    """Print a compact, human-readable view of benchmark results."""
+    if not results:
+        print("No benchmark results.")
+        return
+
+    first = results[0]
+    shape = " x ".join(str(size) for size in first.image_shape)
+    print()
+    print(f"Input:   {first.input_filename}")
+    print(f"Dataset: {first.dataset_type} | Shape: {shape} | Dtype: {first.dtype}")
+    print()
+
+    header = (
+        f"{'Preprocessing':<18} {'Compressor':<23} {'Ratio':>8} "
+        f"{'Bytes':>12} {'Enc MB/s':>9} {'Dec MB/s':>9} "
+        f"{'NZ %':>8} {'Max err':>9} {'OK':>3}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    previous_preprocessing = ""
+    for result in results:
+        preprocessing = _terminal_preprocessing_label(result)
+        if previous_preprocessing and preprocessing != previous_preprocessing:
+            print()
+        previous_preprocessing = preprocessing
+        max_error = (
+            "-"
+            if result.max_absolute_error_vs_raw is None
+            else f"{result.max_absolute_error_vs_raw:.3g}"
+        )
+        print(
+            f"{preprocessing:<18} {result.compressor_name:<23} "
+            f"{result.compression_ratio_vs_raw:>7.2f}x "
+            f"{result.compressed_bytes:>12,} "
+            f"{result.compression_throughput_mb_s:>9.1f} "
+            f"{result.decompression_throughput_mb_s:>9.1f} "
+            f"{result.percent_nonzero_after:>8.3f} "
+            f"{max_error:>9} "
+            f"{'yes' if result.reconstruction_correct else 'NO':>3}"
+        )
+    print()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Benchmark compression candidates.")
-    parser.add_argument("inputs", nargs="+", type=Path, help="Files or directories to test.")
-    parser.add_argument("--out", type=Path, default=Path("results/benchmark.csv"))
-    parser.add_argument("--append", action="store_true", help="Append to the output CSV.")
+    parser = argparse.ArgumentParser(
+        description="Compare lossless compressors on one beamline detector array."
+    )
+    parser.add_argument("--input", type=Path, required=True, help="One .tif, .tiff, or .npy file.")
     parser.add_argument(
-        "--dtype",
-        choices=["bytes", *INTEGER_DTYPES.keys()],
-        default="bytes",
-        help="Interpret input as raw bytes or little-endian integer pixels.",
+        "--dataset-type",
+        required=True,
+        help="Dataset family, such as hedm or sem.",
     )
     parser.add_argument(
-        "--preprocess",
-        choices=["none", "zero-below-median", "zero-below-median-plus-2std"],
-        default="none",
+        "--output",
+        type=Path,
+        default=Path("results/benchmark.csv"),
+        help="CSV output path.",
+    )
+    parser.add_argument("--append", action="store_true", help="Append rows to an existing CSV.")
+    parser.add_argument(
+        "--preprocessing",
+        action="append",
+        choices=["none", "median-std", "right-shift-2", "right-shift-4"],
+        help=(
+            "Run only this preprocessing choice; repeat the option to select more than "
+            "one. The four-method default is used when omitted."
+        ),
     )
     parser.add_argument(
-        "--drop-low-bits",
-        type=int,
-        default=0,
-        help="Clear N low-order bits before compression.",
+        "--fixed-threshold",
+        type=float,
+        help="Add a fixed-value threshold-zeroing run to the selected matrix.",
     )
     parser.add_argument(
-        "--keep-bit-range",
-        type=parse_keep_bit_range,
-        help="Clear all bits except LOW:HIGH, inclusive.",
-    )
-    parser.add_argument(
-        "--no-optional",
+        "--include-optional",
         action="store_true",
-        help="Skip optional codecs even if installed.",
+        help="Also use zstd and lz4 when their packages are installed.",
     )
     return parser
 
 
+def _selected_preprocessing_specs(names: list[str] | None) -> list[PreprocessingSpec]:
+    if names is None:
+        return default_preprocessing_specs()
+
+    choices = {
+        "none": PreprocessingSpec("none", is_lossless=True),
+        "median-std": PreprocessingSpec("median_std_zero", {"k": 2.0}),
+        "right-shift-2": PreprocessingSpec("right_shift", {"bits": 2}),
+        "right-shift-4": PreprocessingSpec("right_shift", {"bits": 4}),
+    }
+    return [choices[name] for name in names]
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    options = PreprocessOptions(
-        dtype=args.dtype,
-        zero_mode=args.preprocess,
-        drop_low_bits=args.drop_low_bits,
-        keep_bit_range=args.keep_bit_range,
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    specs = _selected_preprocessing_specs(args.preprocessing)
+    if args.fixed_threshold is not None:
+        specs.append(fixed_threshold_spec(args.fixed_threshold))
+
+    try:
+        results = benchmark_file(
+            args.input,
+            dataset_type=args.dataset_type,
+            preprocessing_specs=specs,
+            include_optional=args.include_optional,
+        )
+        write_results_csv(args.output, results, append=args.append)
+    except (OSError, TypeError, ValueError) as exc:
+        parser.error(str(exc))
+
+    failures = sum(not result.reconstruction_correct for result in results)
+    print_results_table(results)
+    print(
+        f"Wrote {len(results)} rows for {args.input} to {args.output}; "
+        f"round-trip failures: {failures}"
     )
-
-    all_results: list[BenchmarkResult] = []
-    for input_path in iter_input_files(args.inputs):
-        if not input_path.exists():
-            raise FileNotFoundError(input_path)
-        data = input_path.read_bytes()
-        all_results.extend(
-            run_benchmarks(
-                input_path,
-                data,
-                options,
-                include_optional=not args.no_optional,
-            )
-        )
-
-    write_results(args.out, all_results, append=args.append)
-    for result in all_results:
-        print(
-            f"{result.path} {result.algorithm}: "
-            f"{result.ratio_vs_original:.2f}x, "
-            f"{result.encode_mb_s:.1f} MB/s"
-        )
-    print(f"Wrote {len(all_results)} rows to {args.out}")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

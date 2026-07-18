@@ -7,9 +7,25 @@ name = "beamline-compression"
 version = "0.1.0"
 description = "Compression benchmarking for beamline detector datasets."
 requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "tifffile>=2023.9.26",
+]
+
+[project.optional-dependencies]
+codecs = [
+    "lz4>=4.3",
+    "zstandard>=0.22",
+]
+test = [
+    "pytest>=7.4",
+]
 
 [project.scripts]
 beamcomp-benchmark = "beamcomp.benchmark:main"
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
